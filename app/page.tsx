@@ -1,220 +1,457 @@
+// app/page.tsx
 'use client';
 
-import { useState, useMemo } from 'react';
+import { useEffect, useMemo, useState, useCallback } from 'react';
+import { DiscoveryActivity, DayTheme, DayPlan, TripPlan, UserPreferences } from './types';
 import dynamic from 'next/dynamic';
-
-// --- TypeScript Interfaces ---
-interface Location {
-  name: string;
-  latitude: number;
-  longitude: number;
-}
-interface Activity {
-  time: string;
-  description: string;
-  detailed_description: string;
-  opening_hours: string;
-  location: Location;
-  cost?: string | number;
-  booking_required?: boolean;
-}
-interface Day {
-  day: number;
-  title?: string;
-  activities: Activity[];
-}
-interface ApiResponse {
-  itinerary: Day[];
-}
+import LoadingScreen from './components/LoadingScreen';
+const DayEditor = dynamic(() => import('./DayEditor'), { ssr: false });
+import FinalItineraryView from './FinalItineraryView';
+import { haversineDistanceKm } from './utils';
 
 export default function Home() {
-  const [prompt, setPrompt] = useState('1 day in Las Vegas');
-  const [itinerary, setItinerary] = useState<ApiResponse | null>(null);
+  // --- STATE ---
+  const [destination, setDestination] = useState('Rome, Italy');
+  const [durationDays, setDurationDays] = useState<number>(3);
   const [isLoading, setIsLoading] = useState(false);
+  const [loadingMessage, setLoadingMessage] = useState('');
   const [error, setError] = useState('');
-  const [selectedActivity, setSelectedActivity] = useState<Activity | null>(null);
-  const [mapCenter, setMapCenter] = useState<[number, number]>([36.1716, -115.1391]);
-  const [mapZoom, setMapZoom] = useState(12);
+  const [currentPhase, setCurrentPhase] = useState<'initial' | 'dayThemes' | 'editing' | 'final' | 'optimize'>('initial');
+  const [dayThemes, setDayThemes] = useState<DayTheme[]>([]);
+  const [editingDay, setEditingDay] = useState<number | null>(null);
+  const [trip, setTrip] = useState<TripPlan | null>(null);
+  const [preferences, setPreferences] = useState<UserPreferences>({ 
+    dayStartTime: '09:00', 
+    dayLengthHours: 10, 
+    defaultPace: 'moderate', 
+    defaultTransportMode: 'walking' 
+  });
 
-  // --- UI Controls State ---
-  const [dayLength, setDayLength] = useState('12');
-  const [pacing, setPacing] = useState('moderate');
-  const [likes, setLikes] = useState('');
-  const [dislikes, setDislikes] = useState('');
-  const [travelPreference, setTravelPreference] = useState('balanced');
-
-  const Map = useMemo(() => dynamic(() => import('./Map'), { 
-    loading: () => <p>A map is loading...</p>,
-    ssr: false 
-  }), []);
-
-  const handleActivityClick = (activity: Activity) => {
-    setSelectedActivity(selectedActivity === activity ? null : activity);
-    setMapCenter([activity.location.latitude, activity.location.longitude]);
-    setMapZoom(15);
-  };
-
-  const handleSubmit = async (e: React.FormEvent) => {
+  // --- HANDLERS ---
+  const handleStartPlanning = async (e: React.FormEvent) => {
     e.preventDefault();
+    const startTime = Date.now();
     setIsLoading(true);
+    setLoadingMessage('Generating day themes for your trip...');
     setError('');
-    setItinerary(null);
-    setSelectedActivity(null);
-
+    
     try {
-      const response = await fetch('/api/generate', {
+      // Generate day themes as previews
+      const response = await fetch('/api/generate-days', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt, dayLength, pacing, likes, dislikes, travelPreference }),
+        body: JSON.stringify({
+          destination,
+          duration: String(durationDays)
+        }),
       });
-
-      if (!response.ok) throw new Error(`API Error: ${response.statusText}`);
-      const data: ApiResponse = await response.json();
-      setItinerary(data);
-
-      const firstValidActivity = data.itinerary?.[0]?.activities.find(act => act.location);
-      if (firstValidActivity) {
-        setMapCenter([firstValidActivity.location.latitude, firstValidActivity.location.longitude]);
+      
+      if (!response.ok) throw new Error(`API Error: ${response.status} ${response.statusText}`);
+      const data = await response.json();
+      
+      // Ensure minimum loading time for better UX
+      const elapsed = Date.now() - startTime;
+      const minLoadingTime = 1500; // 1.5 seconds
+      if (elapsed < minLoadingTime) {
+        await new Promise(resolve => setTimeout(resolve, minLoadingTime - elapsed));
       }
+      
+      setDayThemes(data.dayThemes);
+      setTrip({ destination, durationDays, preferences, days: [] });
+      setCurrentPhase('dayThemes');
     } catch (err: any) {
-      setError(err.message || 'Failed to generate itinerary.');
+      setError(err.message || 'Failed to generate day themes.');
     } finally {
       setIsLoading(false);
+      setLoadingMessage('');
     }
   };
 
-  const markers = useMemo(() => {
-    if (!itinerary) return [];
-    return itinerary.itinerary.flatMap(day => 
-      day.activities
-        .filter(activity => activity.location)
-        .map(activity => ({
-          lat: activity.location.latitude,
-          lng: activity.location.longitude,
-          popup: activity.location.name,
-        }))
+  const handleSelectDayTheme = async (dayTheme: DayTheme) => {
+    const startTime = Date.now();
+    setIsLoading(true);
+    setLoadingMessage(`Creating detailed itinerary for ${dayTheme.theme}...`);
+    setError('');
+    setEditingDay(dayTheme.day);
+    
+    try {
+      // Generate detailed itinerary for the selected theme
+      const response = await fetch('/api/generate-itinerary', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          destination,
+          dayTheme,
+          preferences
+        }),
+      });
+      
+      if (!response.ok) throw new Error(`API Error: ${response.status} ${response.statusText}`);
+      const data = await response.json();
+      
+      // Ensure minimum loading time for better UX
+      const elapsed = Date.now() - startTime;
+      const minLoadingTime = 2000; // 2 seconds for detailed itinerary
+      if (elapsed < minLoadingTime) {
+        await new Promise(resolve => setTimeout(resolve, minLoadingTime - elapsed));
+      }
+      
+      // Add the generated day plan to the trip
+      setTrip(prev => {
+        if (!prev) return prev;
+        const others = prev.days.filter(d => d.day !== dayTheme.day);
+        return { ...prev, days: [...others, data.dayPlan].sort((a, b) => a.day - b.day) };
+      });
+      
+      setCurrentPhase('editing');
+    } catch (err: any) {
+      setError(err.message || 'Failed to generate detailed itinerary.');
+    } finally {
+      setIsLoading(false);
+      setLoadingMessage('');
+    }
+  };
+
+  const handleEditorChange = (plan: DayPlan) => {
+    setTrip(prev => {
+      if (!prev) return prev;
+      const others = prev.days.filter(d => d.day !== plan.day);
+      return { ...prev, days: [...others, plan].sort((a, b) => a.day - b.day) };
+    });
+  };
+
+  const handleMakeChanges = async (dayPlan: DayPlan) => {
+    // Regenerate the itinerary with current changes
+    const dayTheme = dayThemes.find(dt => dt.day === dayPlan.day);
+    if (!dayTheme) return;
+    
+    const startTime = Date.now();
+    setIsLoading(true);
+    setLoadingMessage('Regenerating your itinerary with AI...');
+    setError('');
+    
+    try {
+      const response = await fetch('/api/generate-itinerary', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          destination,
+          dayTheme,
+          preferences
+        }),
+      });
+      
+      if (!response.ok) throw new Error(`API Error: ${response.status} ${response.statusText}`);
+      const data = await response.json();
+      
+      // Ensure minimum loading time for better UX
+      const elapsed = Date.now() - startTime;
+      const minLoadingTime = 2000; // 2 seconds for regeneration
+      if (elapsed < minLoadingTime) {
+        await new Promise(resolve => setTimeout(resolve, minLoadingTime - elapsed));
+      }
+      
+      // Replace the current day plan with the regenerated one
+      setTrip(prev => {
+        if (!prev) return prev;
+        const others = prev.days.filter(d => d.day !== dayPlan.day);
+        return { ...prev, days: [...others, data.dayPlan].sort((a, b) => a.day - b.day) };
+      });
+      
+      // Stay in editing mode
+      setEditingDay(dayPlan.day);
+    } catch (err: any) {
+      setError(err.message || 'Failed to regenerate itinerary.');
+    } finally {
+      setIsLoading(false);
+      setLoadingMessage('');
+    }
+  };
+
+  const handleFinishDay = (dayPlan: DayPlan) => {
+    // Mark day as approved and move to next unplanned day or optimization
+    handleEditorChange({ ...dayPlan, approved: true });
+    
+    const remaining = dayThemes.map(d => d.day).filter(d => !trip?.days.some(dp => dp.day === d && dp.approved));
+    const next = remaining.find(d => d !== dayPlan.day);
+    
+    if (next) {
+      // Start planning the next day
+      const nextTheme = dayThemes.find(dt => dt.day === next);
+      if (nextTheme) {
+        handleSelectDayTheme(nextTheme);
+      }
+    } else {
+      // All days planned, move to optimization
+      setCurrentPhase('optimize');
+    }
+  };
+
+  const selectedDayPlan = useMemo(() => {
+    if (editingDay == null) return null;
+    return trip?.days.find(d => d.day === editingDay);
+  }, [editingDay, trip]);
+
+  // Persist trip locally
+  useEffect(() => {
+    if (trip) {
+      try { localStorage.setItem('trip-plan', JSON.stringify(trip)); } catch {}
+    }
+  }, [trip]);
+
+  // --- RENDER LOGIC ---
+
+  if (currentPhase === 'initial') {
+    return (
+      <main className="min-h-screen w-full flex flex-col items-center justify-center p-4">
+        <div className="w-full max-w-2xl mx-auto bg-white dark:bg-zinc-900 rounded-xl shadow-xl p-6 md:p-10 text-center">
+            <h1 className="text-4xl md:text-5xl font-bold text-gray-800 dark:text-white">
+              AI Travel Planner 🌍
+            </h1>
+            <p className="text-lg text-gray-600 dark:text-gray-300 mt-2 mb-6">
+              Tell us where you're going and we'll create the perfect itinerary for you.
+            </p>
+            <form onSubmit={handleStartPlanning} className="space-y-4 text-left">
+              <div>
+                <label htmlFor="destination" className="block text-sm font-semibold text-gray-700 dark:text-gray-300">Destination</label>
+                <input
+                  id="destination"
+                  value={destination}
+                  onChange={(e) => setDestination(e.target.value)}
+                  placeholder="e.g., Rome, Italy"
+                  className="mt-1 w-full p-4 border border-gray-300 dark:border-zinc-700 bg-gray-50 dark:bg-zinc-800 text-gray-900 dark:text-white placeholder-gray-500 rounded-lg text-lg focus:ring-2 focus:ring-blue-500 focus:outline-none transition-all duration-300"
+                  disabled={isLoading}
+                />
+              </div>
+              <div>
+                <label htmlFor="duration" className="block text-sm font-semibold text-gray-700 dark:text-gray-300">Duration (days)</label>
+                <input
+                  id="duration"
+                  type="number"
+                  min={1}
+                  max={14}
+                  value={durationDays}
+                  onChange={(e) => setDurationDays(Number(e.target.value))}
+                  className="mt-1 w-32 p-3 border border-gray-300 dark:border-zinc-700 bg-gray-50 dark:bg-zinc-800 text-gray-900 dark:text-white rounded-lg text-lg focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                  disabled={isLoading}
+                />
+              </div>
+              <button
+                type="submit"
+                disabled={isLoading || !destination || !durationDays}
+                className="w-full text-white p-4 rounded-lg font-semibold text-lg transition-all duration-300 ease-in-out bg-gradient-to-r from-blue-600 to-cyan-500 hover:shadow-xl hover:scale-105 disabled:from-gray-400 disabled:to-gray-500 disabled:cursor-not-allowed disabled:scale-100"
+              >
+                {isLoading ? (
+                  <div className="flex items-center justify-center gap-2">
+                    <div className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
+                    Creating Your Itinerary...
+                  </div>
+                ) : (
+                  'Start Planning'
+                )}
+              </button>
+            </form>
+          </div>
+          {error && <p className="text-red-600 mt-6 text-center text-lg bg-red-100 p-4 rounded-lg max-w-2xl mx-auto">{error}</p>}
+      </main>
     );
-  }, [itinerary]);
+  }
 
   return (
-    <main className="flex min-h-screen flex-col items-center p-4 md:p-12 bg-gray-50 font-sans">
-      <div className="w-full max-w-7xl">
-        <h1 className="text-4xl font-bold mb-6 text-center text-gray-800">AI Travel Planner 🌍</h1>
-        
-        {/* THIS IS THE RESTORED FORM */}
-        <form onSubmit={handleSubmit} className="bg-white p-6 rounded-lg shadow-md mb-8 max-w-4xl mx-auto">
-          <label htmlFor="prompt" className="block text-sm font-medium text-gray-700">Destination & Duration</label>
-          <textarea
-            id="prompt"
-            value={prompt}
-            onChange={(e) => setPrompt(e.target.value)}
-            placeholder="e.g., 3 days in Rome, Italy"
-            className="mt-1 w-full p-3 border border-gray-300 rounded-md shadow-sm text-xl text-black"
-            rows={2}
-            disabled={isLoading}
-          />
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mt-4">
-            <div>
-              <label htmlFor="likes" className="block text-sm font-medium text-gray-700">Likes (e.g., art museums, hiking)</label>
-              <textarea 
-                id="likes"
-                value={likes} 
-                onChange={(e) => setLikes(e.target.value)} 
-                className="mt-1 w-full p-2 border border-gray-300 rounded-md shadow-sm"
-                rows={2}
-              />
-            </div>
-            <div>
-              <label htmlFor="dislikes" className="block text-sm font-medium text-gray-700">Dislikes (e.g., crowded places, shopping)</label>
-              <textarea 
-                id="dislikes"
-                value={dislikes} 
-                onChange={(e) => setDislikes(e.target.value)} 
-                className="mt-1 w-full p-2 border border-gray-300 rounded-md shadow-sm"
-                rows={2}
-              />
-            </div>
-          </div>
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mt-4">
-            <div>
-              <label htmlFor="dayLength" className="block text-sm font-medium text-gray-700">Day Length</label>
-              <select id="dayLength" value={dayLength} onChange={(e) => setDayLength(e.target.value)} className="mt-1 block w-full p-2 border border-gray-300 rounded-md shadow-sm">
-                <option value="8">8 Hours</option>
-                <option value="10">10 Hours</option>
-                <option value="12">12 Hours</option>
-                <option value="14">14+ Hours</option>
-              </select>
-            </div>
-             <div>
-              <label htmlFor="pacing" className="block text-sm font-medium text-gray-700">Pacing</label>
-              <select id="pacing" value={pacing} onChange={(e) => setPacing(e.target.value)} className="mt-1 block w-full p-2 border border-gray-300 rounded-md shadow-sm">
-                <option value="crammed">Crammed</option>
-                <option value="moderate">Moderate</option>
-                <option value="relaxed">Relaxed</option>
-              </select>
-            </div>
-            <div>
-              <label htmlFor="travelPreference" className="block text-sm font-medium text-gray-700">Travel Style</label>
-              <select id="travelPreference" value={travelPreference} onChange={(e) => setTravelPreference(e.target.value)} className="mt-1 block w-full p-2 border border-gray-300 rounded-md shadow-sm">
-                <option value="balanced">Balanced (Walk/Transit)</option>
-                <option value="walking">Walk-Focused</option>
-                <option value="fastest">Fastest (Taxis)</option>
-              </select>
-            </div>
-          </div>
-          <button
-            type="submit"
-            disabled={isLoading || !prompt}
-            className="mt-6 w-full bg-blue-600 text-white p-3 rounded-md font-semibold hover:bg-blue-700 disabled:bg-gray-400 disabled:cursor-not-allowed transition-colors"
-          >
-            {isLoading ? 'Generating...' : 'Generate Itinerary'}
-          </button>
-        </form>
+    <main className="min-h-screen w-full font-sans">
+      <div className="max-w-7xl mx-auto px-4 md:px-8 py-4 md:py-8">
+        <h1 className="text-4xl md:text-5xl font-bold mb-8 text-center bg-gradient-to-r from-blue-600 to-cyan-500 text-transparent bg-clip-text">
+          AI Travel Planner 🌍
+        </h1>
 
-        {error && <p className="text-red-600 mt-4 text-center">{error}</p>}
-        
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
-          <div className="bg-white p-6 rounded-lg shadow-md h-[75vh] overflow-y-auto">
-            <h2 className="text-3xl font-bold mb-4 text-gray-800 sticky top-0 bg-white pb-4 -mt-6 pt-6">Your Itinerary</h2>
-            {isLoading && <p>Loading...</p>}
-            {itinerary && itinerary.itinerary.map((day) => (
-              <div key={day.day}>
-                <h3 className="text-2xl font-semibold my-3 text-blue-700 border-b-2 pb-2">Day {day.day}: {day.title}</h3>
-                <ul className="space-y-2">
-                  {day.activities && day.activities
-                    .filter(activity => activity.location)
-                    .map((activity, index) => (
-                    <li key={index} className="bg-gray-100 rounded-lg">
-                      <div 
-                        onClick={() => handleActivityClick(activity)}
-                        className="p-3 cursor-pointer"
-                      >
-                        <p className="font-bold text-gray-800">{activity.time} - {activity.location.name}</p>
-                        <p className="text-sm text-gray-600">{activity.description}</p>
-                      </div>
-                      
-                      {selectedActivity === activity && (
-                        <div className="p-3 border-t border-gray-200 animate-fade-in space-y-2">
-                          <p className="text-sm">{activity.detailed_description}</p>
-                          <div>
-                            <p><strong>Hours:</strong> {activity.opening_hours}</p>
-                            <p><strong>Cost:</strong> {activity.cost}</p>
-                            {activity.booking_required && <p className="font-bold text-red-500">Booking Required!</p>}
-                          </div>
+        {error && <p className="text-red-600 my-4 text-center text-lg bg-red-100 p-4 rounded-lg max-w-4xl mx-auto">{error}</p>}
+
+        {currentPhase === 'dayThemes' && (
+          <div className="animate-fade-in">
+            <div className="text-center mb-8">
+              <h2 className="text-3xl font-bold">Choose Your Day Themes</h2>
+              <p className="text-gray-600 dark:text-gray-300 mt-2">
+                Select a day theme to start planning. Each theme will be expanded into a full detailed itinerary.
+              </p>
+            </div>
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+              {dayThemes.map(theme => (
+                <div 
+                  key={theme.day} 
+                  className={`bg-white dark:bg-zinc-900 rounded-xl shadow-md p-6 cursor-pointer hover:shadow-xl hover:scale-105 transition-all ${
+                    isLoading && editingDay === theme.day ? 'ring-2 ring-blue-500 ring-offset-2' : ''
+                  }`}
+                  onClick={() => !isLoading && handleSelectDayTheme(theme)}
+                >
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="text-sm font-bold text-blue-600">DAY {theme.day}</span>
+                    {isLoading && editingDay === theme.day && (
+                      <div className="w-4 h-4 border-2 border-blue-600 border-t-transparent rounded-full animate-spin"></div>
+                    )}
+                  </div>
+                  <h3 className="text-2xl font-bold mt-1">{theme.theme}</h3>
+                  <p className="text-gray-600 dark:text-gray-300 mt-2">{theme.summary}</p>
+                  <div className="mt-4 border-t border-gray-200 dark:border-zinc-700 pt-3">
+                    <h4 className="text-xs font-semibold text-gray-500 uppercase">PREVIEW ACTIVITIES:</h4>
+                    <ul className="text-sm mt-2 space-y-1">
+                      {theme.previewActivities?.map(activity => (
+                        <li key={activity.id} className="flex items-center gap-2">
+                          <span className="text-xs">•</span>
+                          <span>{activity.name}</span>
+                          {activity.rating === 3 && (
+                            <span className="text-xs bg-yellow-100 text-yellow-800 px-2 py-0.5 rounded-full">Must-Do</span>
+                          )}
+                        </li>
+                      ))}
+                    </ul>
+                    <div className="mt-3 text-xs text-gray-500">
+                      {isLoading && editingDay === theme.day ? (
+                        <div className="flex items-center gap-2 text-blue-600">
+                          <div className="w-3 h-3 border-2 border-blue-600 border-t-transparent rounded-full animate-spin"></div>
+                          Generating detailed itinerary...
                         </div>
+                      ) : (
+                        'Click to generate full itinerary with 8-15 activities, food stops, and proper timing'
                       )}
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            ))}
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
           </div>
+        )}
 
-          <div className="h-[75vh] w-full rounded-lg shadow-md lg:sticky lg-top-8">
-            <Map center={mapCenter} zoom={mapZoom} markers={markers} />
+        {currentPhase === 'editing' && editingDay != null && selectedDayPlan && (
+          <div className="animate-fade-in">
+            <DayEditor
+              dayNumber={editingDay}
+              theme={selectedDayPlan.theme}
+              summary={selectedDayPlan.summary}
+              activities={selectedDayPlan.items.map(item => ({
+                id: item.activityId,
+                name: item.name,
+                description: item.description,
+                rating: item.rating || 2,
+                imageUrl: item.imageUrl,
+                location: item.location
+              }))}
+              destination={destination}
+              preferences={preferences}
+              dayPlan={selectedDayPlan}
+              onChange={handleEditorChange}
+              onMakeChanges={handleMakeChanges}
+              onFinishDay={handleFinishDay}
+            />
           </div>
-        </div>
+        )}
+
+        {currentPhase === 'optimize' && trip && (
+          <div className="animate-fade-in">
+            <div className="text-center mb-6">
+              <h2 className="text-3xl font-bold">Trip Optimization</h2>
+              <p className="text-gray-600 dark:text-gray-300">We looked across your days for ways to reduce travel time.</p>
+            </div>
+            <OptimizationPanel trip={trip} onAccept={(updated) => { setTrip(updated); setCurrentPhase('final'); }} onSkip={() => setCurrentPhase('final')} />
+          </div>
+        )}
+
+        {currentPhase === 'final' && trip && (
+          <div className="animate-fade-in">
+            <FinalItineraryView trip={trip} onEditDay={(d) => { setEditingDay(d); setCurrentPhase('editing'); }} />
+            <div className="mt-8 flex justify-end">
+              <button
+                onClick={() => { try { localStorage.setItem('trip-plan', JSON.stringify(trip)); } catch {}; alert('Trip saved for offline access.'); }}
+                className="px-6 py-3 rounded-full bg-blue-600 text-white font-semibold hover:bg-blue-700"
+              >
+                Finalize and Save Trip
+              </button>
+            </div>
+          </div>
+        )}
       </div>
+
+      {/* Loading Screen */}
+      {isLoading && (
+        <LoadingScreen 
+          message={loadingMessage} 
+          showProgress={true} 
+        />
+      )}
     </main>
   );
+}
+
+// --- Optimization helper UI inside this file for simplicity ---
+
+interface OptimizationProps {
+  trip: TripPlan;
+  onAccept: (trip: TripPlan) => void;
+  onSkip: () => void;
+}
+
+function OptimizationPanel({ trip, onAccept, onSkip }: OptimizationProps) {
+  const suggestion = computeOptimizationSuggestion(trip);
+  if (!suggestion) {
+    return (
+      <div className="rounded-xl bg-white dark:bg-zinc-900 shadow p-6 text-center">
+        <div className="text-lg">No clear improvements found. You're all set!</div>
+        <button onClick={onSkip} className="mt-4 px-4 py-2 rounded-full border">Continue</button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="rounded-xl bg-white dark:bg-zinc-900 shadow p-6">
+      <div className="text-xl font-semibold">We found a way to make your trip more efficient!</div>
+      <div className="mt-2 text-gray-700 dark:text-gray-300">By making the following change, you could save approximately {Math.round(suggestion.savingMinutes)} minutes of travel time.</div>
+      <div className="mt-4 p-4 rounded-lg border border-gray-200 dark:border-zinc-800">
+        Suggestion: Move <span className="font-semibold">{suggestion.activityName}</span> from Day {suggestion.fromDay} to Day {suggestion.toDay}.
+      </div>
+      <div className="mt-4 flex gap-3">
+        <button onClick={() => onAccept(applySuggestion(trip, suggestion))} className="px-4 py-2 rounded-full bg-green-600 text-white">Accept Suggestion</button>
+        <button onClick={onSkip} className="px-4 py-2 rounded-full border">Decline</button>
+      </div>
+    </div>
+  );
+}
+
+function computeOptimizationSuggestion(trip: TripPlan): null | { activityId: string; activityName: string; fromDay: number; toDay: number; savingMinutes: number } {
+  // Heuristic: for each activity, compute average distance to its own day vs. to other day centroids
+  const dayToCentroid: Record<number, { lat: number; lng: number }> = {};
+  for (const d of trip.days) {
+    if (d.items.length === 0) continue;
+    const avgLat = d.items.reduce((s, it) => s + it.location.latitude, 0) / d.items.length;
+    const avgLng = d.items.reduce((s, it) => s + it.location.longitude, 0) / d.items.length;
+    dayToCentroid[d.day] = { lat: avgLat, lng: avgLng };
+  }
+  let best: null | { activityId: string; activityName: string; fromDay: number; toDay: number; savingMinutes: number } = null;
+  for (const d of trip.days) {
+    for (const item of d.items) {
+      for (const other of trip.days) {
+        if (other.day === d.day) continue;
+        const distToOwn = haversineDistanceKm({ latitude: item.location.latitude, longitude: item.location.longitude }, { latitude: dayToCentroid[d.day].lat, longitude: dayToCentroid[d.day].lng });
+        const distToOther = haversineDistanceKm({ latitude: item.location.latitude, longitude: item.location.longitude }, { latitude: dayToCentroid[other.day].lat, longitude: dayToCentroid[other.day].lng });
+        const deltaKm = distToOwn - distToOther;
+        const minutesSaved = deltaKm * 12; // rough conversion heuristic
+        if (minutesSaved > 20) {
+          if (!best || minutesSaved > best.savingMinutes) {
+            best = { activityId: item.activityId, activityName: item.name, fromDay: d.day, toDay: other.day, savingMinutes: minutesSaved };
+          }
+        }
+      }
+    }
+  }
+  return best;
+}
+
+function applySuggestion(trip: TripPlan, s: { activityId: string; fromDay: number; toDay: number }): TripPlan {
+  const draft = JSON.parse(JSON.stringify(trip)) as TripPlan;
+  const from = draft.days.find(d => d.day === s.fromDay)!;
+  const to = draft.days.find(d => d.day === s.toDay)!;
+  const itemIdx = from.items.findIndex(i => i.activityId === s.activityId);
+  if (itemIdx === -1) return draft;
+  const [moved] = from.items.splice(itemIdx, 1);
+  // Insert at end of "to" day; note times will be off until recomputed by editor later
+  to.items.push(moved);
+  return draft;
 }
